@@ -1,4 +1,8 @@
+from datetime import datetime
+import numpy as np
 import pandas as pd
+import streamlit as st
+
 
 def cargar_y_limpiar_excel(file):
     """Detecta el encabezado y carga el reporte de Mercado Libre."""
@@ -15,40 +19,45 @@ def cargar_y_limpiar_excel(file):
 
 
 def consolidar_reportes(archivos_subidos):
-    """Une múltiples reportes, limpia duplicados y formatea columnas clave."""
+    """
+    Consolida múltiples archivos subidos en Streamlit, soportando 
+    tanto Excel (.xlsx, .xls) como archivos CSV (.csv).
+    """
     lista_dfs = []
+    total_registros_inicial = 0
+    
     for archivo in archivos_subidos:
+        nombre_archivo = archivo.name.lower()
         try:
-            temp_df = cargar_y_limpiar_excel(archivo)
-            lista_dfs.append(temp_df)
-        except Exception:
-            pass
-
+            if nombre_archivo.endswith(('.xlsx', '.xls')):
+                df_temp = pd.read_excel(archivo)
+            elif nombre_archivo.endswith('.csv'):
+                try:
+                    df_temp = pd.read_csv(archivo, encoding='utf-8')
+                except UnicodeDecodeError:
+                    df_temp = pd.read_csv(archivo, encoding='latin-1')
+            else:
+                continue
+            
+            total_registros_inicial += len(df_temp)
+            lista_dfs.append(df_temp)
+        except Exception as e:
+            print(f"Error al leer el archivo {archivo.name}: {e}")
+            
     if not lista_dfs:
         return None, 0, 0
-
+        
     df_consolidado = pd.concat(lista_dfs, ignore_index=True)
-    filas_iniciales = len(df_consolidado)
-
-    # Identificar ID de venta para quitar duplicados
-    col_id_venta = [c for c in df_consolidado.columns if '# de venta' in c or 'N° de venta' in c or 'ID de venta' in c or 'ID' in c]
     
-    if col_id_venta:
-        col_id = col_id_venta[0]
-        df_consolidado = df_consolidado.dropna(subset=[col_id])
-        df_consolidado = df_consolidado[pd.to_numeric(df_consolidado[col_id], errors='coerce').notna()]
-        df_consolidado = df_consolidado.drop_duplicates(subset=[col_id], keep='first')
-    else:
-        df_consolidado = df_consolidado.dropna(how='all')
-
-    filas_finales = len(df_consolidado)
-    duplicados = filas_iniciales - filas_finales
-
-    return df_consolidado, filas_finales, duplicados
+    filas_antes = len(df_consolidado)
+    df_consolidado = df_consolidado.drop_duplicates()
+    duplicados = filas_antes - len(df_consolidado)
+    
+    return df_consolidado, total_registros_inicial, duplicados
 
 
 def identificar_columnas(df):
-    """Detecta dinámicamente las columnas clave del reporte."""
+    """Detecta dinámicamente las columnas clave del reporte y ordena cronológicamente."""
     col_prod = [c for c in df.columns if ('Título' in c or 'Publicación' in c or 'Producto' in c) and 'estado' not in c.lower()]
     col_ing = [c for c in df.columns if 'Ingresos por productos' in c or 'Ingresos' in c or 'Monto' in c or 'Total' in c]
     col_cant = [c for c in df.columns if 'Unidades' in c or 'Cantidad' in c]
@@ -68,7 +77,6 @@ def identificar_columnas(df):
 
     col_f = col_fecha[0] if col_fecha else None
 
-    # Formato numérico y fechas
     if col_ingresos in df.columns:
         df[col_ingresos] = pd.to_numeric(
             df[col_ingresos].astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False).str.strip(),
@@ -83,6 +91,7 @@ def identificar_columnas(df):
 
     if col_f and col_f in df.columns:
         df[col_f] = pd.to_datetime(df[col_f], errors='coerce')
+        df = df.sort_values(by=col_f, ascending=True).reset_index(drop=True)
 
     return df, col_producto, col_ingresos, col_unidades, col_estado, col_f
 
@@ -108,3 +117,86 @@ def obtener_oportunidades_mkt(df, col_producto, col_estado, col_unidades):
     df_patrones['Porcentaje_Zona'] = (df_patrones[col_unidades] / df_patrones['Total_Producto']) * 100
 
     return df_patrones[(df_patrones['Porcentaje_Zona'] >= 20) & (df_patrones[col_unidades] >= 1)]
+
+
+def filtrar_por_busqueda(df, texto_busqueda):
+    """Filtra el DataFrame si el texto coincide con algún ID de venta o nombre de cliente."""
+    if not texto_busqueda:
+        return df
+    
+    cols_a_buscar = [c for c in df.columns if any(k in c.lower() for k in ['venta', 'id', 'comprador', 'cliente', 'apodo'])]
+    if not cols_a_buscar:
+        return df
+
+    mask = False
+    for col in cols_a_buscar:
+        mask = mask | df[col].astype(str).str.contains(texto_busqueda, case=False, na=False)
+        
+    return df[mask]
+
+
+def calcular_deuda_excel(df, col_prod, col_cant, costos_dict, punto_corte):
+    """
+    Calcula la deuda para Excel: desde la primera fila HASTA el folio indicado inclusive.
+    """
+    if df is None or df.empty:
+        return 0.0, pd.DataFrame()
+
+    df_calc = df.copy()
+    df_calc["Costo_Unitario"] = df_calc[col_prod].map(costos_dict).fillna(0.0)
+    df_calc["Subtotal_Deuda"] = df_calc[col_cant] * df_calc["Costo_Unitario"]
+
+    if not punto_corte or not str(punto_corte).strip():
+        return 0.0, pd.DataFrame()
+
+    cols_id = [c for c in df_calc.columns if any(k in c.lower() for k in ['id', 'venta', 'orden', 'folio'])]
+    col_id = cols_id[0] if cols_id else df_calc.columns[0]
+    
+    df_calc = df_calc.reset_index(drop=True)
+    coincidencia = df_calc[df_calc[col_id].astype(str).str.strip() == str(punto_corte).strip()]
+
+    if coincidencia.empty:
+        return 0.0, pd.DataFrame()
+
+    pos_corte = coincidencia.index[0]
+    df_filtrado_deuda = df_calc.iloc[:pos_corte + 1]
+    monto_total = df_filtrado_deuda["Subtotal_Deuda"].sum()
+    
+    return monto_total, df_filtrado_deuda
+
+
+def calcular_deuda_api(df, col_prod, col_cant, costos_dict, punto_corte):
+    """
+    Calcula la deuda para API: ordena cronológicamente y calcula desde el folio indicado HASTA la última fila.
+    """
+    if df is None or df.empty:
+        return 0.0, pd.DataFrame()
+
+    df_calc = df.copy()
+    df_calc["Costo_Unitario"] = df_calc[col_prod].map(costos_dict).fillna(0.0)
+    df_calc["Subtotal_Deuda"] = df_calc[col_cant] * df_calc["Costo_Unitario"]
+
+    if not punto_corte or not str(punto_corte).strip():
+        return 0.0, pd.DataFrame()
+
+    cols_id = [c for c in df_calc.columns if any(k in c.lower() for k in ['id', 'venta', 'orden', 'folio'])]
+    col_id = cols_id[0] if cols_id else df_calc.columns[0]
+    
+    col_fecha = "Fecha" if "Fecha" in df_calc.columns else next((c for c in df_calc.columns if 'fecha' in c.lower()), None)
+
+    if col_fecha and col_fecha in df_calc.columns:
+        df_calc[col_fecha] = pd.to_datetime(df_calc[col_fecha], errors="coerce")
+        df_calc = df_calc.sort_values(by=col_fecha, ascending=True).reset_index(drop=True)
+    else:
+        df_calc = df_calc.reset_index(drop=True)
+
+    coincidencia = df_calc[df_calc[col_id].astype(str).str.strip() == str(punto_corte).strip()]
+
+    if coincidencia.empty:
+        return 0.0, pd.DataFrame()
+
+    pos_corte = coincidencia.index[0]
+    df_filtrado_deuda = df_calc.iloc[pos_corte:]
+    monto_total = df_filtrado_deuda["Subtotal_Deuda"].sum()
+    
+    return monto_total, df_filtrado_deuda
